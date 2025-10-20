@@ -3847,3 +3847,133 @@ func TestTombstoneDensityCompactionMoveOptimization_InvalidStats(t *testing.T) {
 	pc := vs.picker.pickAutoNonScore(compactionEnv{diskAvailBytes: 1 << 30})
 	require.Nil(t, pc, "no compaction should be picked if stats are missing or invalid")
 }
+
+// TestTombstoneDensityCompaction_ConfigurableOverlapRatio verifies that the
+// MaxTombstoneDensityCompactionOverlappingRatio option is respected.
+func TestTombstoneDensityCompaction_ConfigurableOverlapRatio(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	const (
+		inputLevel  = 4
+		outputLevel = 5
+	)
+
+	// Helper to create a file with high tombstone density.
+	makeFile := func(tableNum base.TableNum, startKey, endKey string, size uint64) *manifest.TableMetadata {
+		meta := &manifest.TableMetadata{
+			TableNum: tableNum,
+			Size:     size,
+		}
+		meta.InitPhysicalBacking()
+		meta.TableBacking.PopulateProperties(&sstable.Properties{
+			NumEntries:              10,
+			NumDeletions:            8,
+			NumDataBlocks:           100,
+			NumTombstoneDenseBlocks: 90, // Above default threshold (0.10)
+		})
+		meta.PopulateStats(&manifest.TableStats{})
+		meta.ExtendPointKeyBounds(testkeys.Comparer.Compare,
+			base.ParseInternalKey(startKey),
+			base.ParseInternalKey(endKey),
+		)
+		return meta
+	}
+
+	testCases := []struct {
+		name                 string
+		overlapRatio         float64
+		inputFileSize        uint64
+		outputFilesSize      uint64
+		expectCompactionPick bool
+	}{
+		{
+			name:                 "default threshold allows low overlap",
+			overlapRatio:         0, // Use default (40.0)
+			inputFileSize:        1024,
+			outputFilesSize:      1024 * 30, // 30x overlap ratio
+			expectCompactionPick: true,
+		},
+		{
+			name:                 "default threshold blocks high overlap",
+			overlapRatio:         0, // Use default (40.0)
+			inputFileSize:        1024,
+			outputFilesSize:      1024 * 50, // 50x overlap ratio (> 40)
+			expectCompactionPick: false,
+		},
+		{
+			name:                 "custom low threshold blocks even moderate overlap",
+			overlapRatio:         10.0,
+			inputFileSize:        1024,
+			outputFilesSize:      1024 * 20, // 20x overlap ratio (> 10)
+			expectCompactionPick: false,
+		},
+		{
+			name:                 "custom high threshold allows high overlap",
+			overlapRatio:         100.0,
+			inputFileSize:        1024,
+			outputFilesSize:      1024 * 80, // 80x overlap ratio (< 100)
+			expectCompactionPick: true,
+		},
+		{
+			name:                 "negative ratio disables check, allows any overlap",
+			overlapRatio:         -1.0,
+			inputFileSize:        1024,
+			outputFilesSize:      1024 * 1000, // 1000x overlap ratio
+			expectCompactionPick: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := DefaultOptions()
+			opts.Experimental.TombstoneDenseCompactionThreshold = 0.5 // Lower for test
+			opts.Experimental.NumDeletionsThreshold = 1
+			if tc.overlapRatio != 0 {
+				opts.Experimental.MaxTombstoneDensityCompactionOverlappingRatio = tc.overlapRatio
+			}
+			opts.Experimental.CompactionScheduler = func() CompactionScheduler {
+				return NewConcurrencyLimitSchedulerWithNoPeriodicGrantingForTest()
+			}
+			opts.WithFSDefaults()
+
+			// Create input file in L4 with high tombstone density.
+			metaL4 := makeFile(1, "a.SET.1", "z.SET.2", tc.inputFileSize)
+
+			// Create overlapping files in L6 (not L5, so L5 acts as output level).
+			// We create a single large file to represent the overlap size.
+			var metaL6 []*manifest.TableMetadata
+			if tc.outputFilesSize > 0 {
+				metaL6 = append(metaL6, makeFile(
+					base.TableNum(100),
+					"a.SET.0",
+					"z.SET.0",
+					tc.outputFilesSize,
+				))
+			}
+
+			// Set up the version.
+			var files [numLevels][]*manifest.TableMetadata
+			files[inputLevel] = []*manifest.TableMetadata{metaL4}
+			files[6] = metaL6 // L6 is the last non-empty level
+			vers, latest := newVersionWithLatest(opts, files)
+
+			// Set up a versionSet and compaction picker.
+			vs := &versionSet{
+				opts: opts,
+				cmp:  opts.Comparer,
+			}
+			vs.versions.Init(nil)
+			vs.append(vers)
+			vs.picker = newCompactionPickerByScore(vers, latest, opts, nil)
+
+			// Try to pick a compaction.
+			pc := vs.picker.pickAutoNonScore(compactionEnv{diskAvailBytes: 1 << 30})
+
+			if tc.expectCompactionPick {
+				require.NotNil(t, pc, "expected a compaction to be picked")
+			} else {
+				require.Nil(t, pc, "expected no compaction to be picked due to high overlap ratio")
+			}
+		})
+	}
+}

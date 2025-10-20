@@ -707,6 +707,23 @@ type Options struct {
 		// A zero or negative value disables tombstone density compactions.
 		TombstoneDenseCompactionThreshold float64
 
+		// MaxTombstoneDensityCompactionOverlappingRatio is the maximum ratio of
+		// overlapping bytes in the output level to the file size for a file to be
+		// eligible for tombstone density compaction. If a candidate file has a very
+		// high overlapping ratio, point tombstones in it are likely sparse in keyspace
+		// even if the sstable itself is tombstone dense. These tombstones likely
+		// wouldn't be slow to iterate over, so we exclude these files from tombstone
+		// density compactions. The default value is 40.0.
+		//
+		// Setting this to a lower value makes tombstone density compaction more
+		// conservative, reducing resource usage at the cost of potentially slower
+		// iteration over sparse tombstones.
+		//
+		// To disable the overlapping ratio check entirely, set this to a negative
+		// value (e.g., -1). Note that the zero value (0) is reserved for the default
+		// and will be interpreted as 40.0.
+		MaxTombstoneDensityCompactionOverlappingRatio float64
+
 		// FileCacheShards is the number of shards per file cache.
 		// Reducing the value can reduce the number of idle goroutines per DB
 		// instance which can be useful in scenarios with a lot of DB instances
@@ -1675,6 +1692,9 @@ func (o *Options) EnsureDefaults() {
 	if o.Experimental.TombstoneDenseCompactionThreshold == 0 {
 		o.Experimental.TombstoneDenseCompactionThreshold = 0.10
 	}
+	if o.Experimental.MaxTombstoneDensityCompactionOverlappingRatio == 0 {
+		o.Experimental.MaxTombstoneDensityCompactionOverlappingRatio = 40.0
+	}
 	if o.Experimental.FileCacheShards <= 0 {
 		o.Experimental.FileCacheShards = runtime.GOMAXPROCS(0)
 	}
@@ -1822,6 +1842,7 @@ func (o *Options) String() string {
 	fmt.Fprintf(&buf, "  num_deletions_threshold=%d\n", o.Experimental.NumDeletionsThreshold)
 	fmt.Fprintf(&buf, "  deletion_size_ratio_threshold=%f\n", o.Experimental.DeletionSizeRatioThreshold)
 	fmt.Fprintf(&buf, "  tombstone_dense_compaction_threshold=%f\n", o.Experimental.TombstoneDenseCompactionThreshold)
+	fmt.Fprintf(&buf, "  max_tombstone_density_compaction_overlapping_ratio=%f\n", o.Experimental.MaxTombstoneDensityCompactionOverlappingRatio)
 	// We no longer care about strict_wal_tail, but set it to true in case an
 	// older version reads the options.
 	fmt.Fprintf(&buf, "  strict_wal_tail=%t\n", true)
@@ -2258,6 +2279,8 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 				err = parseErr
 			case "tombstone_dense_compaction_threshold":
 				o.Experimental.TombstoneDenseCompactionThreshold, err = strconv.ParseFloat(value, 64)
+			case "max_tombstone_density_compaction_overlapping_ratio":
+				o.Experimental.MaxTombstoneDensityCompactionOverlappingRatio, err = strconv.ParseFloat(value, 64)
 			case "table_cache_shards":
 				o.Experimental.FileCacheShards, err = strconv.Atoi(value)
 			case "table_format":

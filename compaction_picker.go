@@ -1838,10 +1838,11 @@ func (p *compactionPickerByScore) pickTombstoneDensityCompaction(
 	// If a candidate file has a very high overlapping ratio, point tombstones
 	// in it are likely sparse in keyspace even if the sstable itself is tombstone
 	// dense. These tombstones likely wouldn't be slow to iterate over, so we exclude
-	// these files from tombstone density compactions. The threshold of 40.0 is
+	// these files from tombstone density compactions. The threshold is configurable
+	// through MaxTombstoneDensityCompactionOverlappingRatio. The default of 40.0 is
 	// chosen somewhat arbitrarily, after some observations around excessively large
 	// tombstone density compactions.
-	const maxOverlappingRatio = 40.0
+	maxOverlappingRatio := p.opts.Experimental.MaxTombstoneDensityCompactionOverlappingRatio
 	// NB: we don't consider the lowest level because elision-only compactions
 	// handle that case.
 	lastNonEmptyLevel := numLevels - 1
@@ -1858,9 +1859,12 @@ func (p *compactionPickerByScore) pickTombstoneDensityCompaction(
 			if props.TombstoneDenseBlocksRatio < p.opts.Experimental.TombstoneDenseCompactionThreshold {
 				continue
 			}
-			overlaps := p.vers.Overlaps(lastNonEmptyLevel, f.UserKeyBounds())
-			if float64(overlaps.AggregateSizeSum())/float64(f.Size) > maxOverlappingRatio {
-				continue
+			// Only check overlapping ratio if it's configured (> 0).
+			if maxOverlappingRatio > 0 {
+				overlaps := p.vers.Overlaps(lastNonEmptyLevel, f.UserKeyBounds())
+				if float64(overlaps.AggregateSizeSum())/float64(f.Size) > maxOverlappingRatio {
+					continue
+				}
 			}
 			if candidate == nil || candidateTombstoneDenseBlocksRatio < props.TombstoneDenseBlocksRatio {
 				candidate = f
